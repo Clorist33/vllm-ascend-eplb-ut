@@ -331,10 +331,6 @@ class NPUModelRunner(LoRAModelRunnerMixin):
 
         # Ascend-specific configurations
         self.ascend_config = get_ascend_config()
-        if self.ascend_config.ascend_scheduler_config.enabled:
-            self.chunked_prefill_enabled = self.scheduler_config.enable_chunked_prefill
-        else:
-            self.chunked_prefill_enabled = True
         self.weight_prefetch_method = WeightPrefetchMethod(
             self.ascend_config.weight_prefetch_config)
         # Dump / PrecisionDebugger configuration now comes from AscendConfig
@@ -1940,7 +1936,6 @@ class NPUModelRunner(LoRAModelRunnerMixin):
 
     def _build_attn_state(self, num_reqs, num_scheduled_tokens,
                           num_valid_tokens):
-        ascend_config = get_ascend_config()
         if np.array_equal(self.seq_lens_np[:num_reqs], num_scheduled_tokens):
             attn_state = AscendAttentionState.PrefillNoCache
         # We assume it is the decode stage, where prefill occurs but only one token is not hit in cache.
@@ -1957,7 +1952,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             else:
                 attn_state = AscendAttentionState.ChunkedPrefill
         # splitfuse
-        elif not ascend_config.ascend_scheduler_config.enabled or self.chunked_prefill_enabled:
+        elif self.scheduler_config.enable_chunked_prefill:
             attn_state = AscendAttentionState.ChunkedPrefill
         else:
             attn_state = AscendAttentionState.PrefillCacheHit
@@ -2225,8 +2220,9 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             return None
 
         soc_version = get_ascend_device_type()
-        quant_type = getattr(self.vllm_config.model_config.hf_config,
-                             'moe_quantize', None)
+        quant_type = getattr(
+            self.vllm_config.model_config.hf_config, 'moe_quantize',
+            getattr(self.vllm_config.model_config.hf_config, 'quantize', None))
         model_type = self.vllm_config.model_config.hf_config.model_type
 
         if not self.parallel_config.enable_expert_parallel:
@@ -2245,7 +2241,8 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         elif soc_version in {AscendDeviceType._910_93}:
             moe_comm_type = (MoECommType.MC2
                              if num_tokens <= self.mc2_tokens_capacity else
-                             MoECommType.ALLTOALL)
+                             MoECommType.FUSED_ALLTOALL if quant_type
+                             == "w8a8_dynamic" else MoECommType.ALLTOALL)
         else:
             raise ValueError(f"Unsupported soc_version: {soc_version}")
 
