@@ -47,7 +47,6 @@ from vllm.compilation.monitor import set_cudagraph_capturing_enabled
 from vllm.config import (CompilationMode, CUDAGraphMode, VllmConfig,
                          get_layers_from_vllm_config)
 from vllm.distributed import tensor_model_parallel_all_gather
-from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer
 from vllm.distributed.kv_transfer import (get_kv_transfer_group,
                                           has_kv_transfer_group)
 from vllm.distributed.kv_transfer.kv_connector.v1 import KVConnectorBase_V1
@@ -60,6 +59,7 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.model_executor.layers.rotary_embedding import MRotaryEmbedding
 from vllm.model_executor.model_loader import get_model
+from vllm.model_executor.models.deepseek_mtp import DeepSeekMTP
 from vllm.model_executor.models.interfaces import (SupportsMultiModal,
                                                    supports_mrope,
                                                    supports_transcription)
@@ -92,16 +92,13 @@ from vllm.v1.kv_cache_interface import (AttentionSpec,
                                         UniformTypeKVCacheSpecs)
 from vllm.v1.outputs import (EMPTY_MODEL_RUNNER_OUTPUT, AsyncModelRunnerOutput,
                              DraftTokenIds, LogprobsTensors, ModelRunnerOutput,
-                             PoolerOutput,
-                             make_empty_encoder_model_runner_output)
+                             PoolerOutput)
 from vllm.v1.pool.metadata import PoolingMetadata
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 from vllm.v1.spec_decode.suffix_decoding import SuffixDecodingProposer
 from vllm.v1.utils import CpuGpuBuffer
-from vllm.v1.worker.ec_connector_model_runner_mixin import \
-    ECConnectorModelRunnerMixin
 from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorOutput
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
 from vllm.v1.worker.utils import (AttentionGroup, bind_kv_cache,
@@ -272,7 +269,7 @@ class ExecuteModelState(NamedTuple):
     positions: torch.Tensor
 
 
-class NPUModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
+class NPUModelRunner(LoRAModelRunnerMixin):
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         self.vllm_config = vllm_config
@@ -298,6 +295,7 @@ class NPUModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
                                       'decode_max_num_seqs', 0)
         self.max_num_reqs = max(self.scheduler_config.max_num_seqs,
                                 decode_max_num_seqs)
+        self.mtp_instance = None
         if self.pcp_size > 1:
             self.model_config.max_model_len += 2 * self.pcp_size * self.max_num_reqs
         self.max_num_blocks_per_req = cdiv(self.model_config.max_model_len,
@@ -325,6 +323,7 @@ class NPUModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
         self.attn_groups: list[list[AttentionGroup]] = []
         self.encoder_cache: Dict[str, torch.Tensor] = {}
         self.attn_mask = None
+        self.fia_attn_mask = None
         self.attn_state = None
         self.requests: Dict[str, CachedRequestState] = {}
         self.intermediate_tensors: Optional[IntermediateTensors] = None
@@ -791,11 +790,6 @@ class NPUModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
 
             req_ids_to_add.append(req_id)
 
-        # If this rank is an EC transfer producer,
-        # skip updating the states of KV cache blocks.
-        if has_ec_transfer() and get_ec_transfer().is_producer:
-            return
-
         # Update the states of the running/resumed requests.
         is_last_rank = get_pp_group().is_last_rank
         req_data = scheduler_output.scheduled_cached_reqs
@@ -986,6 +980,23 @@ class NPUModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
         # Pooling situation.
         if self.model_config.runner_type == "pooling" and self.model_config.pooler_config.pooling_type == "CLS":
             return self.attn_mask_builder.get_pooling_mask(self.device)
+        # fia prefill situation.
+        if attn_state in [
+                AscendAttentionState.PrefillNoCache,
+                AscendAttentionState.PrefillCacheHit,
+                AscendAttentionState.ChunkedPrefill
+        ]:
+            return self.attn_mask_builder.get_splitfuse_attn_mask()
+
+        # Decode-only situation.
+        return None
+
+    def _make_fia_attention_mask(self) -> torch.Tensor:
+        # pcp situation.
+        if self.pcp_size > 1:
+            return None
+        if self.attn_mask_builder is None:
+            raise ValueError("Attn mask builder is None")
         return self.attn_mask_builder.get_splitfuse_attn_mask()
 
     def _calc_mrope_positions(self, scheduler_output: "SchedulerOutput"):
@@ -1077,7 +1088,6 @@ class NPUModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
                 output,
                 is_embed=pos_info.is_embed,
             )
-            self.maybe_save_ec_to_connector(self.encoder_cache, mm_hash)
 
     def _batch_mm_kwargs_from_scheduler(
         self,
@@ -1567,6 +1577,7 @@ class NPUModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
         self.attn_mask = self._make_attention_mask(seq_lens=seq_lens_cpu,
                                                    position=positions_cpu,
                                                    attn_state=attn_state)
+        self.fia_attn_mask = self._make_fia_attention_mask()
         self.attn_state = attn_state  # type: ignore
 
         self.with_prefill = with_prefill
@@ -1603,19 +1614,15 @@ class NPUModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
         # _prepare_inputs may reorder the batch, so we must gather
         # multi-modal outputs after that to ensure the correct order
         if self.is_multimodal_model:
-            with self.maybe_get_ec_connector_output(
-                    scheduler_output,
-                    encoder_cache=self.encoder_cache,
-            ):
-                # Run the multimodal encoder if any.
-                self._execute_mm_encoder(scheduler_output)
+            # Run the multimodal encoder if any.
+            self._execute_mm_encoder(scheduler_output)
 
-                # NOTE(woosuk): To unify token ids and soft tokens (vision
-                # embeddings), we always use embeddings (rather than token ids)
-                # as input to the multimodal model, even when the input is text.
-                input_ids = self.input_ids[:total_num_scheduled_tokens]
-                mm_embeds, is_mm_embed = self._gather_mm_embeddings(
-                    scheduler_output)
+            # NOTE(woosuk): To unify token ids and soft tokens (vision
+            # embeddings), we always use embeddings (rather than token ids)
+            # as input to the multimodal model, even when the input is text.
+            input_ids = self.input_ids[:total_num_scheduled_tokens]
+            mm_embeds, is_mm_embed = self._gather_mm_embeddings(
+                scheduler_output)
 
             inputs_embeds = self.model.embed_input_ids(
                 input_ids,
@@ -1795,6 +1802,7 @@ class NPUModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
                 num_computed_tokens_cpu=num_computed_tokens_cpu,
                 positions=self.positions,
                 attn_mask=self.attn_mask,
+                fia_attn_mask=self.fia_attn_mask,
                 spec_attn_mask=self.spec_attn_mask,
                 attn_state=self.attn_state,
                 is_only_prefill=bool(np.all(num_valid_tokens != 1)),
@@ -2259,15 +2267,6 @@ class NPUModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
 
         with ProfileExecuteDuration().capture_async("prepare input"):
             self._update_states(scheduler_output)
-            if has_ec_transfer() and get_ec_transfer().is_producer:
-                with self.maybe_get_ec_connector_output(
-                        scheduler_output,
-                        encoder_cache=self.encoder_cache,
-                ):
-                    self._execute_mm_encoder(scheduler_output)
-                    return make_empty_encoder_model_runner_output(
-                        scheduler_output)
-
             if not scheduler_output.total_num_scheduled_tokens:
                 if not has_kv_transfer_group():
                     logger.debug(
@@ -2723,10 +2722,10 @@ class NPUModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
             self.query_lens = torch.from_numpy(num_scheduled_tokens)
 
             assigned_mask_dim = 2048
-            self.attn_mask = torch.triu(torch.ones(assigned_mask_dim,
-                                                   assigned_mask_dim),
-                                        diagonal=1).to(torch.int8).to(
-                                            self.device)
+            self.fia_attn_mask = torch.triu(torch.ones(assigned_mask_dim,
+                                                       assigned_mask_dim),
+                                            diagonal=1).to(torch.int8).to(
+                                                self.device)
 
             num_computed_tokens_cpu = (
                 self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs])
@@ -2770,6 +2769,7 @@ class NPUModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
                     num_computed_tokens_cpu=num_computed_tokens_cpu,
                     positions=self.positions,
                     attn_mask=self.attn_mask,
+                    fia_attn_mask=self.fia_attn_mask,
                     spec_attn_mask=self.spec_attn_mask,
                     attn_state=self.attn_state,
                     max_query_len=max_query_len,
@@ -3041,6 +3041,8 @@ class NPUModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
                     dummy_compute_logits=dummy_drafter_compute_logits)
             if self.in_profile_run and self.dynamic_eplb:
                 self.model.clear_all_moe_loads()
+                if self.mtp_instance is not None:
+                    self.drafter.model.model.clear_all_moe_loads()
             if not self.in_profile_run and self.dynamic_eplb:
                 self.eplb_updator.take_update_info_from_eplb_process()
                 self.eplb_updator.forward_end()
@@ -3163,9 +3165,16 @@ class NPUModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
     def eplb_warmup(self):
         if self.dynamic_eplb and not self.is_eplb_warmuped:
             self.is_eplb_warmuped = True
-            self.eplb_adaptor = VllmEplbAdaptor(model=self.model)
+            mtp_instance = self.mtp_instance
+            if mtp_instance is not None:
+                num_mtp_layers = mtp_instance.model.num_mtp_layers
+            else:
+                num_mtp_layers = 0
+            self.eplb_adaptor = VllmEplbAdaptor(model=self.model,
+                                                mtp_instance=mtp_instance,
+                                                num_mtp_layers=num_mtp_layers)
             self.eplb_loader.set_adator(self.eplb_adaptor)
-            self.eplb_updator.set_adaptor(self.eplb_adaptor)
+            self.eplb_updator.set_adaptor(self.eplb_adaptor, num_mtp_layers)
             self.eplb_updator.warm_up_eplb()
 
     def load_model(self) -> None:
@@ -3188,6 +3197,18 @@ class NPUModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
             if self.drafter:
                 logger.info("Loading drafter model...")
                 self.drafter.load_model(self.model)
+                if self.speculative_config and self.speculative_config.method == 'deepseek_mtp':
+                    assert isinstance(self.drafter, MtpProposer), \
+                        f"drafter type wrong: {type(self.drafter)}"
+                    assert isinstance(self.drafter.model, (DeepSeekMTP, ACLGraphWrapper)), \
+                        f"drafter type wrong: {type(self.drafter)}, only support DeepSeekMTP or ACLGraphWrapper"
+                    if isinstance(self.drafter.model, DeepSeekMTP):
+                        mtp_instance = self.drafter.model
+                    elif isinstance(self.drafter.model, ACLGraphWrapper):
+                        mtp_instance = self.drafter.model.unwrap()
+                    self.mtp_instance = mtp_instance
+                    model_register(mtp_instance.model, self.vllm_config)
+
                 if self.drafter.name == SpecDcodeType.EAGLE3:
                     self.model.set_aux_hidden_state_layers(
                         self.model.get_eagle3_aux_hidden_state_layers())
@@ -3761,10 +3782,6 @@ class NPUModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
             KVCacheSpec: A dictionary mapping layer names to their KV cache
             format. Layers that do not need KV cache are not included.
         """
-
-        if has_ec_transfer() and get_ec_transfer().is_producer:
-            return {}
-
         block_size = self.vllm_config.cache_config.block_size
         use_mla = self.vllm_config.model_config.use_mla
         kv_cache_spec: dict[str, KVCacheSpec] = {}
